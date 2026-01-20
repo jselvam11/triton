@@ -16,17 +16,23 @@ from triton.backends.driver import DriverBase
 
 def _find_metal_runtime_lib():
     """Find the MetalRuntime dynamic library."""
-    # Check common locations relative to this file
-    base_dir = Path(__file__).parent.parent.parent.parent  # triton root
+    # Resolve symlinks to get the real path (needed because backend may be symlinked)
+    real_file = Path(__file__).resolve()
+    # Go up from third_party/metal/backend/driver.py to triton root
+    base_dir = real_file.parent.parent.parent.parent
+
     possible_paths = [
+        # Swift package manager output (arm64 macOS)
+        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "arm64-apple-macosx" / "debug" / "libMetalRuntime.dylib",
+        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "arm64-apple-macosx" / "release" / "libMetalRuntime.dylib",
+        # Swift package manager output (legacy paths)
+        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "debug" / "libMetalRuntime.dylib",
+        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "release" / "libMetalRuntime.dylib",
         # Build output directories
         base_dir / "metal-dialect" / "build" / "debug" / "lib" / "libMetalRuntime.dylib",
         base_dir / "metal-dialect" / "build" / "release" / "lib" / "libMetalRuntime.dylib",
         # Installed locations
         Path("/usr/local/lib/libMetalRuntime.dylib"),
-        # Swift package manager output
-        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "debug" / "libMetalRuntime.dylib",
-        base_dir / "metal-dialect" / "MetalRuntime" / ".build" / "release" / "libMetalRuntime.dylib",
     ]
 
     for path in possible_paths:
@@ -231,6 +237,9 @@ class MetalLauncher:
 
     def _launch_native(self, gridX, gridY, gridZ, function, kernel_args):
         """Launch kernel using native MetalRuntime."""
+        import torch
+        import ctypes
+
         # function is the metallib data
         metallib_data = function if isinstance(function, bytes) else b''
 
@@ -243,11 +252,50 @@ class MetalLauncher:
             metallib_path = f.name
 
         try:
+            # Separate tensor args from scalar args
+            tensor_args = []
+            scalar_args = []
+            for arg in kernel_args:
+                if hasattr(arg, 'data_ptr'):
+                    tensor_args.append(arg)
+                elif isinstance(arg, (int, float)):
+                    scalar_args.append(arg)
+
+            # Create Metal buffers and copy data from MPS tensors
+            metal_buffers = []
+            for tensor in tensor_args:
+                # Get tensor size in bytes
+                num_elements = tensor.numel()
+                element_size = tensor.element_size()
+                byte_size = num_elements * element_size
+
+                # Create Metal buffer (isStorageModeManaged=True for CPU access)
+                # sizeType: 4 = float32
+                size_type = {1: 1, 2: 2, 4: 4, 8: 8}.get(element_size, 4)
+                metal_buf = self._lib._MetalDeviceMakeBuffer(
+                    self._device, True, num_elements, size_type
+                )
+                metal_buffers.append((metal_buf, tensor, byte_size))
+
+                # Copy data from MPS tensor to Metal buffer via CPU
+                cpu_tensor = tensor.cpu()
+                buf_ptr = self._lib._MetalBufferGetContents2(metal_buf)
+                ctypes.memmove(buf_ptr, cpu_tensor.data_ptr(), byte_size)
+
+            # Calculate total threads needed
+            # For the stub kernel, we need one thread per element
+            # The first tensor's size determines the work size
+            if tensor_args:
+                total_threads = tensor_args[0].numel()
+            else:
+                total_threads = gridX * self.num_warps * 32
+
+            # Create command buffer
             cmd_buffer = self._lib._MetalCommandQueueMakeCommandBuffer(
                 self._queue,
                 metallib_path.encode('utf-8'),
                 self.kernel_name.encode('utf-8'),
-                gridX * self.num_warps * 32,
+                total_threads,
                 gridY,
                 gridZ
             )
@@ -256,15 +304,26 @@ class MetalLauncher:
                 raise RuntimeError("Failed to create Metal command buffer")
 
             # Bind buffer arguments
-            for idx, arg in enumerate(kernel_args):
-                if hasattr(arg, 'data_ptr'):
-                    ptr = arg.data_ptr()
-                    # Would bind Metal buffer here
-                    pass
+            for idx, (metal_buf, _, _) in enumerate(metal_buffers):
+                self._lib._MetalCommandBufferAddBuffer(cmd_buffer, metal_buf, idx)
 
+            # Execute kernel
             self._lib._MetalCommandBufferCommit(cmd_buffer)
             self._lib._MetalCommandBufferWaitUntilCompleted(cmd_buffer)
+
+            # Copy results back from Metal buffers to MPS tensors
+            for metal_buf, tensor, byte_size in metal_buffers:
+                buf_ptr = self._lib._MetalBufferGetContents2(metal_buf)
+                # Create CPU tensor to receive data
+                cpu_tensor = torch.empty_like(tensor, device='cpu')
+                ctypes.memmove(cpu_tensor.data_ptr(), buf_ptr, byte_size)
+                # Copy to MPS tensor
+                tensor.copy_(cpu_tensor.to('mps'))
+
+            # Cleanup
             self._lib._MetalRelease(cmd_buffer)
+            for metal_buf, _, _ in metal_buffers:
+                self._lib._MetalRelease(metal_buf)
 
         finally:
             os.unlink(metallib_path)
