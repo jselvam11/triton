@@ -34,6 +34,7 @@ class MetalOptions:
     sanitize_overflow: bool = True
     backend_name: str = 'metal'
     arch: str = None
+    instrumentation_mode: str = ""
     # Metal-specific options
     threads_per_warp: int = 32  # Metal SIMD width
     max_threadgroup_memory: int = 32768  # 32KB typical for Apple GPUs
@@ -128,7 +129,7 @@ class MetalBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod)
+        pm.run(mod, 'make_ttir')
         return mod
 
     @staticmethod
@@ -162,7 +163,7 @@ class MetalBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.common.add_canonicalizer(pm)
 
-        pm.run(mod)
+        pm.run(mod, 'make_ttgir')
 
         # Extract shared memory size from module
         metadata["shared"] = mod.get_int_attr("ttg.shared") or 0
@@ -283,11 +284,16 @@ kernel void triton_kernel(
                 print("Metal toolchain not available (xcrun not found)", file=sys.stderr)
                 return b''
 
-    def add_stages(self, stages, options):
+    def add_stages(self, stages, options, language=None):
         """
         Register compilation stages.
 
         Pipeline: ttir -> ttgir -> msl -> metallib
+
+        Args:
+            stages: Dictionary to register compilation stages
+            options: MetalOptions instance
+            language: Source language (e.g., 'ttir', unused for Metal)
         """
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)

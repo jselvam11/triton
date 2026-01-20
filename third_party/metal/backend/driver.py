@@ -76,12 +76,13 @@ class MetalUtils:
             device: Device index
 
         Returns:
-            Tuple of (module, function, n_regs, n_spills)
-            For Metal, we return (metallib_data, metallib_data, 0, 0)
+            Tuple of (module, function, n_regs, n_spills, n_max_threads)
+            For Metal, we return (metallib_data, metallib_data, 0, 0, 1024)
         """
         # For Metal, the "module" and "function" are the metallib data
         # The actual Metal API calls happen in the launcher
-        return (kernel, kernel, 0, 0)
+        # n_max_threads = 1024 (typical Metal threadgroup size limit)
+        return (kernel, kernel, 0, 0, 1024)
 
 
 class MetalLauncher:
@@ -349,6 +350,36 @@ class MetalDriver(DriverBase):
             return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
         except ImportError:
             return False
+
+    def map_python_to_cpp_type(self, ty: str) -> str:
+        """
+        Converts a Triton type string to its corresponding C++ type string for Metal.
+
+        Args:
+            ty: The Triton type string (e.g., 'i32', '*fp16', 'fp32')
+
+        Returns:
+            The C++ type string for Metal
+        """
+        if ty.startswith('*'):
+            return "device void*"  # Metal device pointer
+        return {
+            "i1": "bool",
+            "i8": "int8_t",
+            "i16": "int16_t",
+            "i32": "int32_t",
+            "i64": "int64_t",
+            "u1": "bool",
+            "u8": "uint8_t",
+            "u16": "uint16_t",
+            "u32": "uint32_t",
+            "u64": "uint64_t",
+            "fp16": "half",
+            "bf16": "bfloat",  # Metal 3.1+
+            "fp32": "float",
+            "f32": "float",
+            "fp64": "double",  # Limited Metal support
+        }.get(ty, ty)
 
     def get_current_target(self):
         """Get the current GPU target for Metal."""
