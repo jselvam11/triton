@@ -1,10 +1,15 @@
 """
 Metal backend compiler for Triton.
 Handles TTIR -> TTGIR -> MSL -> metallib compilation pipeline.
+
+Option C (LLVM-based) approach:
+- Detects matmul patterns and generates specialized simdgroup_matrix code
+- Uses Apple's Metal toolchain which is LLVM-based internally
+- Targets AIR (Apple Intermediate Representation) through MSL
 """
 
 from triton.backends.compiler import BaseBackend, GPUTarget
-from triton._C.libtriton import ir, passes
+from triton._C.libtriton import ir, passes, metal
 
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -38,6 +43,8 @@ class MetalOptions:
     # Metal-specific options
     threads_per_warp: int = 32  # Metal SIMD width
     max_threadgroup_memory: int = 32768  # 32KB typical for Apple GPUs
+    # Option C: Use LLVM-based lowering
+    use_llvm_lowering: bool = False
 
     def __post_init__(self):
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -58,8 +65,8 @@ class MetalBackend(BaseBackend):
     Compilation pipeline:
     1. TTIR: Triton IR with standard optimizations
     2. TTGIR: TritonGPU IR with BlockedEncodingAttr
-    3. MSL: Metal Shading Language source
-    4. metallib: Compiled Metal library binary
+    3. MSL: Metal Shading Language source (with simdgroup_matrix for matmul)
+    4. metallib: Compiled Metal library binary (via AIR)
     """
 
     @staticmethod
@@ -88,27 +95,23 @@ class MetalBackend(BaseBackend):
     def get_codegen_implementation(self, options):
         """Return codegen functions for Metal-specific type conversions."""
         codegen_fns = {
-            "min_dot_size": self._min_dot_size
+            "min_dot_size": self._min_dot_size()
         }
         return codegen_fns
 
     def _min_dot_size(self):
         """Return minimum dot product size for Metal."""
         def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:
-            # Metal doesn't have native matrix multiply like CUDA's Tensor Cores
-            # Use standard sizes
-            return (16, 16, 16)
+            # simdgroup_matrix uses 8x8 tiles
+            return (8, 8, 8)  # (min_m, min_n, min_k)
         return check_dot_compatibility
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         """Return module map for Metal-specific libraries."""
-        # No special library modules needed for now
         return {}
 
     def load_dialects(self, ctx):
         """Load Metal MLIR dialect into context."""
-        # For now, we don't need to load the Metal dialect for the initial pipeline
-        # The conversion happens at the MSL generation stage
         pass
 
     @staticmethod
@@ -145,10 +148,6 @@ class MetalBackend(BaseBackend):
         pm.enable_debug()
 
         # Convert to TTGPUIR with blocked layout
-        # Target string format: "metal:<arch>"
-        # num_warps: number of warps (32 threads each on Metal)
-        # warp_size: 32 (Metal SIMD width)
-        # num_ctas: 1 (no multi-CTA for now)
         passes.ttir.add_convert_to_ttgpuir(pm, f"metal:{opt.arch}",
                                            opt.num_warps, 32, opt.num_ctas)
 
@@ -174,65 +173,60 @@ class MetalBackend(BaseBackend):
         """
         Convert TTGIR to Metal Shading Language.
 
-        For initial implementation, dump the IR as a string.
-        TODO: Implement proper TTGIR -> Metal dialect -> MSL translation.
+        Uses direct C++ translation to convert TTGIR to MSL source code.
+        The MSL code uses simdgroup_matrix for hardware-accelerated matmul.
         """
-        # For now, return the TTGIR IR as a placeholder
-        # In the full implementation, this would:
-        # 1. Convert TTGIR to Metal dialect
-        # 2. Translate Metal dialect to MSL string
+        # Dump TTGIR for debugging
+        if os.environ.get('TRITON_METAL_DEBUG'):
+            import sys
+            print("=== TTGIR ===", file=sys.stderr)
+            print(str(src), file=sys.stderr)
+            print("=============", file=sys.stderr)
 
-        ttgir_str = str(src)
+        # Translate TTGIR to MSL using C++ backend
+        msl_code = metal.translate_to_msl(src)
 
-        # Check if we have the metal-translate tool available
-        metal_translate = self._find_metal_translate()
+        # Dump MSL for debugging
+        if os.environ.get('TRITON_METAL_DEBUG'):
+            import sys
+            print("=== MSL ===", file=sys.stderr)
+            print(msl_code, file=sys.stderr)
+            print("===========", file=sys.stderr)
 
-        if metal_translate is None:
-            # Fallback: generate a minimal MSL kernel stub
-            msl_code = self._generate_stub_msl(metadata, options)
-            metadata["name"] = "triton_kernel"
-            return msl_code
+        if not msl_code.strip():
+            raise RuntimeError("MSL translation produced empty output")
 
-        # TODO: Use metal-translate to convert TTGIR to MSL
-        # For now, generate a stub
-        msl_code = self._generate_stub_msl(metadata, options)
         metadata["name"] = "triton_kernel"
         return msl_code
 
-    def _find_metal_translate(self):
-        """Find the metal-translate binary."""
-        # Check common locations
-        possible_paths = [
-            os.path.join(os.path.dirname(__file__), "..", "..", "..",
-                        "metal-dialect", "build", "debug", "bin", "metal-translate"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "..",
-                        "metal-dialect", "build", "release", "bin", "metal-translate"),
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        return None
+    def make_llvmir(self, src, metadata, options):
+        """
+        Convert TTGIR to LLVM IR targeting AIR.
 
-    def _generate_stub_msl(self, metadata, options):
-        """Generate a minimal MSL kernel stub for testing."""
-        # This is a placeholder - the real implementation will come from
-        # the Metal dialect's MSL translator
-        return f'''#include <metal_stdlib>
-using namespace metal;
+        This is the Option C path - proper LLVM-based lowering.
+        """
+        if os.environ.get('TRITON_METAL_DEBUG'):
+            import sys
+            print("=== TTGIR (for LLVM) ===", file=sys.stderr)
+            print(str(src), file=sys.stderr)
+            print("========================", file=sys.stderr)
 
-kernel void triton_kernel(
-    device float* arg0 [[buffer(0)]],
-    device float* arg1 [[buffer(1)]],
-    device float* arg2 [[buffer(2)]],
-    uint3 tid [[thread_position_in_grid]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tgsize [[threads_per_threadgroup]])
-{{
-    // Stub kernel - to be replaced with generated code
-    uint idx = tid.x;
-    arg2[idx] = arg0[idx] + arg1[idx];
-}}
-'''
+        # Use the LLVM lowering pass
+        try:
+            llvm_ir = metal.translate_to_llvmir(src, options.arch or "apple-m1")
+        except Exception as e:
+            import sys
+            print(f"LLVM lowering failed: {e}, falling back to MSL", file=sys.stderr)
+            return None
+
+        if os.environ.get('TRITON_METAL_DEBUG'):
+            import sys
+            print("=== LLVM IR ===", file=sys.stderr)
+            print(llvm_ir, file=sys.stderr)
+            print("===============", file=sys.stderr)
+
+        metadata["name"] = "triton_kernel"
+        return llvm_ir
 
     def make_metallib(self, src, metadata, options):
         """
@@ -253,7 +247,7 @@ kernel void triton_kernel(
 
             try:
                 # Compile MSL to AIR
-                subprocess.run([
+                result = subprocess.run([
                     'xcrun', '-sdk', 'macosx', 'metal',
                     '-c', msl_path,
                     '-o', air_path
@@ -271,29 +265,70 @@ kernel void triton_kernel(
                     return f.read()
 
             except subprocess.CalledProcessError as e:
-                # Return empty bytes if compilation fails
-                # This allows testing the pipeline without Metal toolchain
                 import sys
                 print(f"Metal compilation failed: {e}", file=sys.stderr)
                 if e.stderr:
                     print(f"stderr: {e.stderr.decode()}", file=sys.stderr)
-                return b''
+                # Also print the MSL source for debugging
+                print(f"MSL source:\n{src}", file=sys.stderr)
+                raise RuntimeError(f"Metal compilation failed: {e}")
             except FileNotFoundError:
-                # xcrun not found (not on macOS)
+                raise RuntimeError("Metal toolchain not available (xcrun not found)")
+
+    def make_metallib_from_llvmir(self, src, metadata, options):
+        """
+        Compile LLVM IR to Metal library binary.
+
+        Uses Apple's Metal toolchain with LLVM IR input:
+        1. LLVM IR -> AIR (via metal -x ir)
+        2. AIR -> metallib
+        """
+        if src is None:
+            return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llvm_path = os.path.join(tmpdir, "kernel.ll")
+            air_path = os.path.join(tmpdir, "kernel.air")
+            lib_path = os.path.join(tmpdir, "kernel.metallib")
+
+            # Write LLVM IR source
+            with open(llvm_path, 'w') as f:
+                f.write(src)
+
+            try:
+                # Compile LLVM IR to AIR
+                subprocess.run([
+                    'xcrun', '-sdk', 'macosx', 'metal',
+                    '-x', 'ir',
+                    '-c', llvm_path,
+                    '-o', air_path
+                ], check=True, capture_output=True)
+
+                # Link AIR to metallib
+                subprocess.run([
+                    'xcrun', '-sdk', 'macosx', 'metallib',
+                    air_path,
+                    '-o', lib_path
+                ], check=True, capture_output=True)
+
+                # Read the metallib binary
+                with open(lib_path, 'rb') as f:
+                    return f.read()
+
+            except subprocess.CalledProcessError as e:
                 import sys
-                print("Metal toolchain not available (xcrun not found)", file=sys.stderr)
-                return b''
+                print(f"LLVM IR compilation failed: {e}", file=sys.stderr)
+                if e.stderr:
+                    print(f"stderr: {e.stderr.decode()}", file=sys.stderr)
+                return None
+            except FileNotFoundError:
+                return None
 
     def add_stages(self, stages, options, language=None):
         """
         Register compilation stages.
 
         Pipeline: ttir -> ttgir -> msl -> metallib
-
-        Args:
-            stages: Dictionary to register compilation stages
-            options: MetalOptions instance
-            language: Source language (e.g., 'ttir', unused for Metal)
         """
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
@@ -302,7 +337,6 @@ kernel void triton_kernel(
 
     def hash(self):
         """Return a unique hash for this backend configuration."""
-        # Include Metal SDK version if available
         try:
             result = subprocess.run(
                 ['xcrun', '--show-sdk-version'],
